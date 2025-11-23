@@ -1,0 +1,195 @@
+pipeline {
+    agent any
+    environment {
+        WEBSITE_URL = 'https://bizup.app'
+        WHATSAPP_NUMBER = '+14155238886'
+        VOICE_NUMBER = '+19786439765'
+        DESTINATION_PHONES = '+916204843730,+918449664848,+919958527800'
+        S3_BUCKET = 'bizup-builds'
+        AWS_REGION = 'ap-south-1'
+        S3_REPORT_PATH = 'bizup-health-check-report'
+        REPORT_DIR = 'health_check_reports'
+        JENKINS_URL = 'https://ci.navofashion.in'  // Updated domain
+        JENKINS_BUILD_URL = "${JENKINS_URL}/${env.BUILD_URL.replaceFirst(/^https?:\/\/[^\/]+/, '')}"
+    }
+    stages {
+        stage('Health Check') {
+            steps {
+                script {
+                    // Perform website health check
+                    def statusCode = sh(script: "curl -s -o /dev/null -w '%{http_code}' ${WEBSITE_URL}", returnStdout: true).trim()
+                    
+                    if (statusCode != "200") {
+                        echo "Website is DOWN (Status: ${statusCode}) - Sending alerts"
+                        
+                        // Create report directory if not exists
+                        sh "mkdir -p ${REPORT_DIR}"
+                        
+                        // Generate timestamp for report
+                        def timestamp = sh(script: 'date +"%Y%m%d_%H%M%S"', returnStdout: true).trim()
+                        def reportFile = "${REPORT_DIR}/failure_${timestamp}_build${BUILD_NUMBER}.txt"
+
+                        // Generate report content
+                        def currentTime = sh(script: 'date +"%Y-%m-%d %H:%M:%S %Z"', returnStdout: true).trim()
+                        def serverInfo = sh(script: 'curl -s http://ip-api.com/line/?fields=country,regionName,city,isp,query', returnStdout: true).trim().split('\n')
+                        def responseTime = sh(script: "curl -o /dev/null -s -w '%{time_total}s' ${WEBSITE_URL}", returnStdout: true).trim()
+                        def sslStatus = sh(script: "curl -o /dev/null -s -w '%{ssl_verify_result}' ${WEBSITE_URL}", returnStdout: true).trim() == "0" ? "✅ Valid" : "❌ Invalid"
+                        
+                        // Save detailed report to file
+                        writeFile file: reportFile, text: """
+                        BIZUP FASHION WEBSITE FAILURE REPORT
+                        ===================================
+                        
+                        Timestamp: ${currentTime}
+                        Jenkins Build: ${BUILD_NUMBER}
+                        Build URL: ${JENKINS_BUILD_URL}
+                        
+                        Website URL: ${WEBSITE_URL}
+                        HTTP Status: ${statusCode}
+                        Response Time: ${responseTime}seconds
+                        SSL Status: ${sslStatus}
+                        
+                        Server Information:
+                        - IP Address: ${serverInfo[4]}
+                        - Country: ${serverInfo[0]}
+                        - Region: ${serverInfo[1]}
+                        - City: ${serverInfo[2]}
+                        - ISP: ${serverInfo[3]}
+                        """
+
+                        // Upload report to S3
+                        withCredentials([usernamePassword(
+                        credentialsId: 'aws-s3-creds',
+                        usernameVariable: 'AWS_ACCESS_KEY_ID',
+                        passwordVariable: 'AWS_SECRET_ACCESS_KEY'
+                        )]) {
+                            sh """
+                                aws s3 cp ${reportFile} \
+                                s3://${S3_BUCKET}/${S3_REPORT_PATH}/${timestamp}_build${BUILD_NUMBER}.txt \
+                                --region ${AWS_REGION}
+                            """
+                            // Store S3 URL for artifact storage
+                            S3_REPORT_URL = "https://${S3_BUCKET}.s3.${AWS_REGION}.amazonaws.com/${S3_REPORT_PATH}/${timestamp}_build${BUILD_NUMBER}.txt"
+
+                                                        
+                            // Save S3 URL to build description
+                            currentBuild.description = "Website Status: DOWN (${statusCode})"
+
+                            // Save only the S3 URL to a file and archive it
+                            writeFile file: "${REPORT_DIR}/s3_url.txt", text: S3_REPORT_URL
+                            archiveArtifacts artifacts: "${REPORT_DIR}/s3_url.txt", allowEmptyArchive: true
+                            
+                            // Clean up the local report file
+                            sh "rm -f ${reportFile}"
+                        }
+
+                        //1. Google Chat Alert (with build link but no S3 link)
+                        withCredentials([string(credentialsId: 'google-chat-webhook', variable: 'WEBHOOK_URL')]) {
+                            def alertMessage = """{
+                                "text": "🚨 *Bizup Health Check Alert* ❌
+
+🔗 *Website URL*: ${WEBSITE_URL}
+🛑 *HTTP Status*: ${statusCode}
+⏱️ *Response Time*: ${responseTime}s
+🔐 *SSL*: ${sslStatus}
+🕒 *Alert Time*: ${currentTime}
+
+🌍 *Server Location*:
+   • IP: ${serverInfo[4]}
+   • Country: ${serverInfo[0]}
+   • Region: ${serverInfo[1]}
+   • City: ${serverInfo[2]}
+   • ISP: ${serverInfo[3]}
+
+🔧 *Build Details*:
+   • Build: #${BUILD_NUMBER}
+   • Build Link: <${JENKINS_BUILD_URL}|View Build>
+   
+⚠️ *Action*: Immediate investigation required!"
+                                 }"""
+
+                            // Secure way to handle the webhook URL
+                            writeFile file: 'webhook_url.tmp', text: WEBHOOK_URL
+
+sh """
+    WEBHOOK_URL_VALUE=\$(cat webhook_url.tmp)
+    curl -X POST "\$WEBHOOK_URL_VALUE" \\
+    -H 'Content-Type: application/json' \\
+    -d '${alertMessage.replace("'", "'\\\\''")}'
+    rm -f webhook_url.tmp
+"""
+}
+                        // 2. WhatsApp Alerts to multiple numbers (with build link but no S3 link)
+                        def whatsappNumbers = env.DESTINATION_PHONES.split(',')
+                        whatsappNumbers.each { number ->
+                            withCredentials([
+                                string(credentialsId: 'twilio-sid', variable: 'TWILIO_SID'),
+                                string(credentialsId: 'twilio-token', variable: 'TWILIO_TOKEN')
+                            ]) {
+                                sh """
+                                    curl -X POST "https://api.twilio.com/2010-04-01/Accounts/${TWILIO_SID}/Messages.json" \
+                                    --data-urlencode "Body=🚨 *Bizup Health Check Alert* 🚨\\n\\n
+🔗 *URL*: ${WEBSITE_URL}
+🛑 *HTTP Status*: ${statusCode} ${statusCode == '200' ? '✅' : '❌'}
+🕒 *Time*: ${currentTime}
+⏱️ *Response Time*: ${responseTime}s
+🔐 *SSL*: ${sslStatus}
+
+🌍 *Server Location*:
+  • Country: ${serverLocation[0]}
+  • Region: ${serverLocation[1]} 
+  • City: ${serverLocation[2]}
+  • ISP: ${serverLocation[3]}
+
+🔧 *Build Details*:
+   • Build: #${BUILD_NUMBER}
+   • Build Link: <${JENKINS_BUILD_URL}|View Build>
+
+⚠️ *Action Required*: 
+Please investigate immediately." \
+                                    --data-urlencode "From=whatsapp:${WHATSAPP_NUMBER}" \
+                                    --data-urlencode "To=whatsapp:${number.trim()}" \
+                                    -u "${TWILIO_SID}:${TWILIO_TOKEN}"
+                                """
+                            }
+                        }
+
+                        // 3. Voice Call Alerts to multiple numbers (unchanged)
+                        def voiceNumbers = env.DESTINATION_PHONES.split(',')
+                        voiceNumbers.each { number ->
+                            withCredentials([
+                                string(credentialsId: 'twilio-sid', variable: 'TWILIO_SID'),
+                                string(credentialsId: 'twilio-token', variable: 'TWILIO_TOKEN')
+                            ]) {
+                                sh """
+                                    curl -X POST "https://api.twilio.com/2010-04-01/Accounts/${TWILIO_SID}/Calls.json" \
+                                    --data-urlencode "Url=https://handler.twilio.com/twiml/EH1573462e46a6cd71bce2ea9abefaf7c4" \
+                                    --data-urlencode "To=${number.trim()}" \
+                                    --data-urlencode "From=${VOICE_NUMBER}" \
+                                    -u "${TWILIO_SID}:${TWILIO_TOKEN}"
+                                """
+                            }
+                        }
+
+                        error("Website is DOWN - Alerts triggered. Report: ${S3_REPORT_URL}")
+                    } else {
+                        echo "✅ Website is UP (Status: ${statusCode})"
+                        currentBuild.description = "Website Status: UP (${statusCode})"
+                    }
+                }
+            }
+        }
+    }
+    post {
+         always {
+            echo """
+            =========== Health Check Summary ===========
+            Website: ${WEBSITE_URL}
+            Status: ${currentBuild.result == 'FAILURE' ? '❌ DOWN' : '✅ UP'}
+            Build: #${BUILD_NUMBER}
+            Build URL: ${JENKINS_BUILD_URL}
+            ===========================================
+            """
+        }
+    }
+}
