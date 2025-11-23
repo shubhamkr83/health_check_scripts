@@ -1,0 +1,499 @@
+pipeline {
+    agent any
+
+    environment {
+        NVM_DIR = '/home/ubuntu/.nvm'
+        PATH = "${NVM_DIR}/versions/node/v20.15.0/bin:${env.PATH}"
+
+        COLLECTION_PATH = 'Payment Health Check.postman_collection.json'
+        DATE_STR = """${new Date().format('yyyy-MM-dd_HH_MM')}"""
+        REPORT_JSON = "postman_reports/${DATE_STR}_result.json"
+        REPORT_HTML = "postman_reports/${DATE_STR}_result.html"
+        S3_BUCKET = 'bizup-builds'
+        S3_BASE_FOLDER = 'API_Automation'
+        S3_REPORT_PATH = "reports/postman/result-${env.BUILD_NUMBER}.html"
+        GOOGLE_CHAT_WEBHOOK = credentials('google-chat-webhook')
+        MAX_FAILURES_TO_DISPLAY = 10
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+            }
+        }
+
+        stage('Setup Environment Variables') {
+            steps {
+                script {
+                    // Determine branch name and set S3 folder accordingly
+                    def branchName = env.BRANCH_NAME ?: env.GIT_BRANCH?.replaceAll('origin/', '') ?: 'unknown'
+                    
+                    // Set branch-specific folder
+                    def branchFolder = ''
+                    if (branchName == 'main' || branchName == 'master') {
+                        branchFolder = 'main'
+                    } else if (branchName == 'dev' || branchName == 'develop') {
+                        branchFolder = 'dev'
+                    } else {
+                        // For other branches, use sanitized branch name
+                        branchFolder = branchName.toLowerCase().replaceAll('[^a-z0-9-]', '-')
+                    }
+                    
+                    // Set environment variables for S3 paths
+                    env.BRANCH_FOLDER = branchFolder
+                    env.S3_FOLDER = "${env.S3_BASE_FOLDER}/${branchFolder}"
+                    env.S3_URL = "https://${env.S3_BUCKET}.s3.ap-south-1.amazonaws.com/${env.S3_FOLDER}/${env.S3_REPORT_PATH}"
+                    
+                    echo "🌿 Branch: ${branchName}"
+                    echo "📁 Branch Folder: ${branchFolder}"
+                    echo "☁️ S3 Folder: ${env.S3_FOLDER}"
+                    echo "🔗 S3 URL: ${env.S3_URL}"
+                }
+            }
+        }
+
+        stage('Setup Node Environment') {
+            steps {
+                sh '''#!/bin/bash
+                if [ -s "$NVM_DIR/nvm.sh" ]; then
+                    . "$NVM_DIR/nvm.sh"
+                    nvm use v20.15.0
+                fi
+                echo "Node version: $(node --version)"
+                echo "NPM version: $(npm --version)"
+                
+                echo "🔧 Installing dependencies..."
+                npm install
+                
+                echo "📦 Verifying Newman installation..."
+                newman --version || {
+                    echo "❌ Newman not found, installing globally..."
+                    npm install -g newman
+                }
+                
+                                
+                echo "📋 Final verification:"
+                echo "Newman version: $(newman --version)"
+                '''
+            }
+        }
+
+        stage('Run Postman Tests') {
+            steps {
+                script {
+                    def maxRetries = 3
+                    def retryDelay = 20 // seconds
+                    def attempt = 1
+                    def testsPassed = false
+                    
+                    while (attempt <= maxRetries && !testsPassed) {
+                        echo "🚀 Starting Newman tests - Attempt ${attempt}/${maxRetries}"
+                        
+                        // Ensure directory exists
+                        sh '''#!/bin/bash
+                        echo "📁 Ensuring postman_reports directory exists..."
+                        mkdir -p postman_reports
+                        echo "🧹 Cleaning any previous reports to avoid stale uploads..."
+                        rm -f postman_reports/*.json || true
+                        rm -f postman_reports/*.html || true
+                        '''
+                        
+                        // Update report filenames for each attempt
+                        def attemptSuffix = attempt > 1 ? "_attempt${attempt}" : ""
+                        env.REPORT_JSON = "postman_reports/${DATE_STR}${attemptSuffix}_result.json"
+                        env.REPORT_HTML = "postman_reports/${DATE_STR}${attemptSuffix}_result.html"
+                        
+                        // Run Newman with explicit filename
+                        def result = sh (
+                            script: """#!/bin/bash
+                            echo "🔧 Preparing for Newman run (Attempt ${attempt})..."
+                            if [ ! -f "\$COLLECTION_PATH" ]; then
+                                echo "❌ Collection file not found: \$COLLECTION_PATH"
+                                exit 1
+                            fi
+                            
+                            echo "🔧 Running Newman with CLI, JSON, and HTML reporters..."
+                            
+                            # Force the exact timestamped filename
+                            newman run "\$COLLECTION_PATH" \\
+                              --reporters cli,json,html \\
+                              --reporter-json-export "\$REPORT_JSON" \\
+                              --reporter-html-export "\$REPORT_HTML" \\
+                              --suppress-exit-code
+                            
+                            NEWMAN_EXIT_CODE=\$?
+                            echo "📊 Newman exit code: \$NEWMAN_EXIT_CODE"
+                            
+                            # Strict verification of expected files
+                            echo "📋 Verifying generated files..."
+                            if [ ! -f "\$REPORT_JSON" ]; then
+                                echo "❌ CRITICAL: Expected JSON report not created at \$REPORT_JSON"
+                                exit 1
+                            fi
+
+                            if [ ! -f "\$REPORT_HTML" ]; then
+                                echo "❌ CRITICAL: Expected HTML report not created at \$REPORT_HTML"
+                                exit 1
+                            fi
+
+                            # Sanity: ensure reports are fresh (modified within last 30 minutes)
+                            if ! find "\$(dirname \"\$REPORT_JSON\")" -maxdepth 1 -name "\$(basename \"\$REPORT_JSON\")" -mmin -30 | grep -q .; then
+                                echo "❌ Report JSON is older than 30 minutes. Refusing to use a stale file."
+                                ls -l "\$REPORT_JSON"
+                                exit 1
+                            fi
+
+                            if ! find "\$(dirname \"\$REPORT_HTML\")" -maxdepth 1 -name "\$(basename \"\$REPORT_HTML\")" -mmin -30 | grep -q .; then
+                                echo "❌ Report HTML is older than 30 minutes. Refusing to use a stale file."
+                                ls -l "\$REPORT_HTML"
+                                exit 1
+                            fi
+                            
+                            echo "✅ Reports verified:"
+                            echo "JSON: \$REPORT_JSON (\$(du -h "\$REPORT_JSON" | cut -f1))"
+                            echo "HTML: \$REPORT_HTML (\$(du -h "\$REPORT_HTML" | cut -f1))"
+                            
+                            exit \$NEWMAN_EXIT_CODE
+                            """,
+                            returnStatus: true
+                        )
+                        
+                        // IMPROVED TEST ANALYSIS - Fixed the logic to properly detect failures
+                        echo "📊 Newman final exit code for attempt ${attempt}: ${result}"
+                        
+                        if (fileExists(env.REPORT_JSON)) {
+                            echo "🔍 Analyzing JSON report for test failures..."
+                            def json = readFile(env.REPORT_JSON)
+                            def jsonObj = readJSON text: json
+                            
+                            def totalRequests = 0
+                            def failedRequests = 0
+                            def totalAssertions = 0
+                            def failedAssertions = 0
+                            def hasFailures = false
+                            
+                            // Analyze executions for both request failures and assertion failures
+                            if (jsonObj.run?.executions) {
+                                jsonObj.run.executions.each { exec ->
+                                    totalRequests++
+                                    def requestFailed = false
+                                    
+                                    // Check for HTTP errors or response issues
+                                    if (exec.response?.code >= 400 || exec.response?.error) {
+                                        requestFailed = true
+                                        hasFailures = true
+                                    }
+                                    
+                                    // Check for assertion failures
+                                    if (exec.assertions) {
+                                        exec.assertions.each { assertion ->
+                                            totalAssertions++
+                                            if (assertion.error) {
+                                                failedAssertions++
+                                                hasFailures = true
+                                                if (!requestFailed) {
+                                                    requestFailed = true
+                                                }
+                                            }
+                                        }
+                                    } else if (exec.item?.events) {
+                                        // Check for test script failures in events
+                                        exec.item.events.each { event ->
+                                            if (event.listen == 'test' && event.script?.exec) {
+                                                // This indicates test scripts exist but might have failed
+                                                totalAssertions++
+                                            }
+                                        }
+                                    }
+                                    
+                                    if (requestFailed) {
+                                        failedRequests++
+                                    }
+                                }
+                            }
+                            
+                            // Also check run.stats for additional metrics
+                            def runStats = jsonObj.run?.stats
+                            if (runStats) {
+                                echo "📊 Run Stats from Newman (Attempt ${attempt}):"
+                                echo "   Requests: ${runStats.requests?.total ?: 0} (${runStats.requests?.failed ?: 0} failed)"
+                                echo "   Assertions: ${runStats.assertions?.total ?: 0} (${runStats.assertions?.failed ?: 0} failed)"
+                                echo "   Test Scripts: ${runStats.testScripts?.total ?: 0} (${runStats.testScripts?.failed ?: 0} failed)"
+                                
+                                // Use Newman's own statistics as the source of truth
+                                totalRequests = runStats.requests?.total ?: totalRequests
+                                failedRequests = runStats.requests?.failed ?: failedRequests
+                                totalAssertions = runStats.assertions?.total ?: totalAssertions
+                                failedAssertions = runStats.assertions?.failed ?: failedAssertions
+                                
+                                // Newman considers a run failed if any requests failed OR any assertions failed
+                                hasFailures = (failedRequests > 0) || (failedAssertions > 0) || (runStats.testScripts?.failed > 0)
+                            }
+                            
+                            echo "📊 Test Results Summary (Attempt ${attempt}):"
+                            echo "   Total Requests: ${totalRequests}"
+                            echo "   Failed Requests: ${failedRequests}"
+                            echo "   Total Assertions: ${totalAssertions}"
+                            echo "   Failed Assertions: ${failedAssertions}"
+                            echo "   Request Success Rate: ${totalRequests > 0 ? String.format('%.2f', (totalRequests - failedRequests) / totalRequests * 100) : '0.00'}%"
+                            echo "   Assertion Success Rate: ${totalAssertions > 0 ? String.format('%.2f', (totalAssertions - failedAssertions) / totalAssertions * 100) : '0.00'}%"
+                            
+                            if (!hasFailures) {
+                                testsPassed = true
+                                echo "✅ All tests passed on attempt ${attempt}: ${totalRequests} requests successful, ${totalAssertions} assertions passed"
+                            } else {
+                                echo "❌ Tests failed on attempt ${attempt}: ${failedRequests} request(s) failed, ${failedAssertions} assertion(s) failed"
+                                
+                                if (attempt < maxRetries) {
+                                    echo "⏳ Waiting ${retryDelay} seconds before retry..."
+                                    sleep(retryDelay)
+                                }
+                            }
+                        } else {
+                            echo "⚠️ JSON report not found for attempt ${attempt} - cannot determine test results"
+                            if (result != 0) {
+                                echo "❌ Newman execution failed with exit code: ${result}"
+                                if (attempt < maxRetries) {
+                                    echo "⏳ Waiting ${retryDelay} seconds before retry..."
+                                    sleep(retryDelay)
+                                }
+                            } else {
+                                echo "⚠️ Newman completed but no report generated"
+                            }
+                        }
+                        
+                        attempt++
+                    }
+                    
+                    // Set final build result
+                    if (!testsPassed) {
+                        currentBuild.result = 'FAILURE'
+                        echo "❌ Tests failed after ${maxRetries} attempts"
+                        // Store retry information for notification
+                        env.RETRY_ATTEMPTS = maxRetries.toString()
+                        env.FINAL_ATTEMPT_FAILED = 'true'
+                    } else {
+                        echo "✅ Tests passed successfully"
+                        if (attempt > 2) {
+                            // Tests passed but required retries - store this info
+                            env.RETRY_ATTEMPTS = (attempt - 1).toString()
+                            env.TESTS_PASSED_ON_RETRY = 'true'
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        failure {
+            script {
+                echo "💥 Build failed - sending notifications..."
+                def modifiedBuildUrl = env.BUILD_URL.replace('https://usop.bizup.app', 'https://ci.navofashion.in')
+                
+                try {
+                    if (fileExists(env.REPORT_JSON)) {
+                        def json = readFile(env.REPORT_JSON)
+                        def jsonObj = readJSON text: json
+                        
+                        def failedTests = []
+                        def totalRequests = 0
+                        def failedRequestsCount = 0
+                        def totalAssertions = 0
+                        def failedAssertions = 0
+                        
+                        // Use Newman's run.stats for accurate counts
+                        def runStats = jsonObj.run?.stats
+                        if (runStats) {
+                            totalRequests = runStats.requests?.total ?: 0
+                            failedRequestsCount = runStats.requests?.failed ?: 0
+                            totalAssertions = runStats.assertions?.total ?: 0
+                            failedAssertions = runStats.assertions?.failed ?: 0
+                        }
+                        
+                        // Collect detailed failure information
+                        if (jsonObj.run?.executions) {
+                            jsonObj.run.executions.each { exec ->
+                                def testName = exec.item?.name ?: 'Unknown Test'
+                                def requestHasFailed = false
+                                
+                                // Check for HTTP errors
+                                if (exec.response?.code >= 400 || exec.response?.error) {
+                                    requestHasFailed = true
+                                    failedTests << "🔴 *${testName}:*"
+                                    failedTests << "   ⚡ HTTP ${exec.response?.code ?: 'Error'}: ${exec.response?.status ?: 'Request failed'}"
+                                }
+                                
+                                // Check for assertion failures
+                                if (exec.assertions?.any { it.error != null }) {
+                                    if (!requestHasFailed) {
+                                        failedTests << "🔴 *${testName}:*"
+                                    }
+                                    exec.assertions.findAll { it.error != null }.each { assertion ->
+                                        failedTests << "   ❗ ${assertion.assertion} - ${assertion.error?.message ?: 'Unknown error'}"
+                                    }
+                                }
+                            }
+                        }
+                        
+                        def displayedFailures = failedTests.take(env.MAX_FAILURES_TO_DISPLAY.toInteger() * 2)
+                        if (failedTests.size() > displayedFailures.size()) {
+                            displayedFailures << "📋 *...and ${(failedTests.size() - displayedFailures.size())/2} more failures*"
+                        }
+
+                        def failureSummary = ""
+                        if (failedRequestsCount > 0 && failedAssertions > 0) {
+                            failureSummary = "📊 ${failedRequestsCount}/${totalRequests} requests failed, ${failedAssertions}/${totalAssertions} assertions failed"
+                        } else if (failedRequestsCount > 0) {
+                            failureSummary = "📊 ${failedRequestsCount}/${totalRequests} requests failed"
+                        } else if (failedAssertions > 0) {
+                            failureSummary = "📊 ${failedAssertions}/${totalAssertions} assertions failed"
+                        } else {
+                            failureSummary = "🔍 Tests failed (check logs for details)"
+                        }
+
+                        // Add retry information to the message
+                        def retryInfo = ""
+                        if (env.RETRY_ATTEMPTS && env.FINAL_ATTEMPT_FAILED == 'true') {
+                            retryInfo = "\n🔄 *Retry Attempts:* Failed after ${env.RETRY_ATTEMPTS} attempts"
+                        }
+
+                        googlechatnotification(
+                            url: GOOGLE_CHAT_WEBHOOK,
+                            message: """
+🚨 *Payment Health Check Automation Tests Failed*
+
+${failureSummary}${retryInfo}
+
+📋 *Failed Tests:* 
+${displayedFailures.join('\n')}
+
+🔗 *Quick Links:*
+• 📱 *Build URL:* <${modifiedBuildUrl}|Click Here>
+• 📊 *Report URL:* <${env.S3_URL}|Click Here>
+
+🌿 *Branch:* ${env.BRANCH_FOLDER}
+🔢 *Build Number:* ${env.BUILD_NUMBER}
+⏰ *Time:* ${new Date().format('yyyy-MM-dd HH:mm:ss')}
+"""
+                        )
+                    } else {
+                        googlechatnotification(
+                            url: GOOGLE_CHAT_WEBHOOK,
+                            message: """
+🚨 *Payment Health Check Automation Tests Failed*
+
+❓ *Status:* Tests failed - Report not generated
+
+🔗 *Quick Links:*
+• 📱 *Build URL:* <${modifiedBuildUrl}|Click Here>
+
+🌿 *Branch:* ${env.BRANCH_FOLDER}
+🔢 *Build Number:* ${env.BUILD_NUMBER}
+⏰ *Time:* ${new Date().format('yyyy-MM-dd HH:mm:ss')}
+💡 *Note:* Check build logs - report generation may have failed
+"""
+                        )
+                    }
+                } catch (Exception err) {
+                    echo "⚠️ Error processing failure notification: ${err.message}"
+                    googlechatnotification(
+                        url: GOOGLE_CHAT_WEBHOOK,
+                        message: """
+🚨 *Payment Health Check Automation Tests Failed*
+
+❌ *Error:* ${err.message}
+
+🌿 *Branch:* ${env.BRANCH_FOLDER}
+🔢 *Build Number:* ${env.BUILD_NUMBER}
+⏰ *Time:* ${new Date().format('yyyy-MM-dd HH:mm:ss')}
+"""
+                    )
+                }
+            }
+        }
+
+        always {
+            script {
+                echo "📋 Starting post-build actions..."
+                
+                withCredentials([
+                    usernamePassword(
+                        credentialsId: 'aws-s3-creds',
+                        usernameVariable: 'AWS_ACCESS_KEY_ID',
+                        passwordVariable: 'AWS_SECRET_ACCESS_KEY'
+                    )
+                ]) {
+                    try {
+                        sh '''#!/bin/bash
+                        echo "🔧 Configuring AWS CLI..."
+                        aws configure set aws_access_key_id "$AWS_ACCESS_KEY_ID"
+                        aws configure set aws_secret_access_key "$AWS_SECRET_ACCESS_KEY"
+                        aws configure set default.region ap-south-1
+                        
+                        echo "📤 Uploading HTML report to S3..."
+
+                        # Check if HTML report exists
+                        if [ ! -f "$REPORT_HTML" ]; then
+                            echo "❌ Expected HTML report file not found at $REPORT_HTML"
+                            exit 1
+                        fi
+
+                        # Ensure report is fresh (not stale)
+                        if ! find "$(dirname "$REPORT_HTML")" -maxdepth 1 -name "$(basename "$REPORT_HTML")" -mmin -30 | grep -q .; then
+                            echo "❌ Report HTML is older than 30 minutes. Aborting upload to avoid re-uploading stale file."
+                            ls -l "$REPORT_HTML"
+                            exit 1
+                        fi
+                        
+                        echo "☁️ Uploading: $REPORT_HTML to s3://$S3_BUCKET/$S3_FOLDER/$S3_REPORT_PATH"
+                        aws s3 cp "$REPORT_HTML" "s3://$S3_BUCKET/$S3_FOLDER/$S3_REPORT_PATH" --acl public-read
+                        
+                        # Verify upload (size-based to support multipart uploads)
+                        echo "🔍 Verifying upload (by size)..."
+                        LOCAL_SIZE=$(stat -c%s "$REPORT_HTML" 2>/dev/null || wc -c < "$REPORT_HTML")
+                        S3_SIZE=$(aws s3api head-object --bucket "$S3_BUCKET" --key "$S3_FOLDER/$S3_REPORT_PATH" --query 'ContentLength' --output text)
+
+                        echo "Local size: $LOCAL_SIZE bytes"
+                        echo "S3 size:    $S3_SIZE bytes"
+
+                        if [ "$LOCAL_SIZE" != "$S3_SIZE" ]; then
+                            echo "❌ Upload verification failed - size mismatch"
+                            exit 1
+                        fi
+                        '''
+                        
+                        // Create and archive summary
+                        def artifactSummary = """
+Branch: ${env.BRANCH_FOLDER}
+Build Number: ${env.BUILD_NUMBER}
+Build Date: ${new Date()}
+Build Status: ${currentBuild.result ?: 'SUCCESS'}
+S3 Report URL: ${env.S3_URL}
+Report Filename: ${env.REPORT_HTML}
+Local JSON Report: ${env.REPORT_JSON}
+Jenkins Build URL: ${env.BUILD_URL}
+"""
+                        writeFile file: 's3_report_summary.txt', text: artifactSummary
+                        archiveArtifacts artifacts: "s3_report_summary.txt", fingerprint: true
+                        
+                    } catch (err) {
+                        echo "❌ S3 upload failed: ${err.message}"
+                        archiveArtifacts artifacts: "postman_reports/**", fingerprint: true
+                    }
+                }
+            }
+        }
+
+        success {
+            script {
+                echo "🎉 Build completed successfully!"
+                echo "📊 Report available at: ${env.S3_URL}"
+                
+                // Success notification removed - only alerting on failures
+                // Report is still uploaded to S3 and available via the URL above
+            }
+        }
+    }
+}

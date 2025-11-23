@@ -1,0 +1,29 @@
+{
+  "name": "payment-health-check",
+  "version": "1.0.0",
+  "description": "Payment Health Check Automation using Postman/Newman",
+  "main": "index.js",
+  "scripts": {
+    "test": "newman run \"Payment Health Check.postman_collection.json\"",
+    "test:json": "newman run \"Payment Health Check.postman_collection.json\" --reporters cli,json --reporter-json-export postman_reports/result.json",
+    "test:html": "newman run \"Payment Health Check.postman_collection.json\" --reporters cli,html --reporter-html-export postman_reports/result.html",
+    "test:all": "newman run \"Payment Health Check.postman_collection.json\" --reporters cli,json,html --reporter-json-export postman_reports/result.json --reporter-html-export postman_reports/result.html"
+  },
+  "keywords": [
+    "api",
+    "automation",
+    "postman",
+    "newman",
+    "testing"
+  ],
+  "author": "Bizup Automation Team",
+  "license": "ISC",
+  "dependencies": {
+    "newman": "^6.1.3"
+  },
+  "devDependencies": {},
+  "engines": {
+    "node": ">=18.0.0",
+    "npm": ">=8.0.0"
+  }
+}

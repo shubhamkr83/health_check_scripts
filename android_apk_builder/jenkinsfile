@@ -1,0 +1,213 @@
+pipeline {
+    agent any
+
+    parameters {
+        string(name: 'BRANCH_NAME', defaultValue: 'develop', description: 'Branch to build from')
+    }
+
+    environment {
+        JAVA_HOME = '/usr/lib/jvm/java-17-openjdk-amd64'
+        ANDROID_HOME = '/opt/android-sdk'
+        PATH = "${env.JAVA_HOME}/bin:${env.ANDROID_HOME}/cmdline-tools/latest/bin:${env.PATH}"
+        BUILD_TOOLS_VERSION = '34.0.0'
+        S3_BUCKET = 'bizup-builds'
+        AWS_REGION = 'ap-south-1'
+    }
+
+    stages {
+
+        stage('Checkout Code') {
+            steps {
+                checkout([
+                    $class: 'GitSCM',
+                    branches: [[name: "*/${params.BRANCH_NAME}"]],
+                    userRemoteConfigs: [[
+                        credentialsId: 'jenkins-key',
+                        url: 'git@github.com:Bizup-world/android.git'
+                    ]]
+                ])
+            }
+        }
+
+        stage('Verify Environment') {
+            steps {
+                sh '''
+                    echo "=== Build Environment ==="
+                    echo "JAVA_HOME: $JAVA_HOME"
+                    java -version
+                    echo "Build Tools:"
+                    ls -la $ANDROID_HOME/build-tools/$BUILD_TOOLS_VERSION
+                    echo "Gradle:"
+                    ./gradlew -version
+                '''
+            }
+        }
+
+        stage('Build & Upload Debug APK') {
+            steps {
+                sh './gradlew clean assembleDebug --stacktrace --no-daemon'
+
+                script {
+                    sh '''
+                        mkdir -p artifacts
+                        for apk in app/build/outputs/apk/debug/*.apk; do
+                            [ -f "$apk" ] || continue
+                            name=$(basename "$apk" .apk | sed 's/-debug$//' | sed 's/^bizup-//I')
+                            newname="Bizup-${name}-debug-${BUILD_NUMBER}.apk"
+                            cp "$apk" "artifacts/$newname"
+                            sha256sum "artifacts/$newname" > "artifacts/$newname.sha256"
+                        done
+                    '''
+                }
+
+                withCredentials([usernamePassword(
+                    credentialsId: 'aws-s3-creds',
+                    usernameVariable: 'AWS_ACCESS_KEY_ID',
+                    passwordVariable: 'AWS_SECRET_ACCESS_KEY'
+                )]) {
+                    sh '''
+                        export LANG=en_US.UTF-8
+                        export LC_ALL=en_US.UTF-8
+
+                        > artifacts/s3_links.txt
+                        echo "1. Debug APKs Uploaded:" >> artifacts/s3_links.txt
+                        echo "----------------------------------------" >> artifacts/s3_links.txt
+
+                        for file in artifacts/*debug*.apk artifacts/*debug*.apk.sha256; do
+                            aws s3 cp "$file" "s3://${S3_BUCKET}/builds/${BUILD_NUMBER}/$(basename $file)" --region ${AWS_REGION}
+                        done
+
+                        for file in artifacts/*debug*.apk; do
+                            echo "- $(basename $file):" >> artifacts/s3_links.txt
+                            echo "https://${S3_BUCKET}.s3.${AWS_REGION}.amazonaws.com/builds/${BUILD_NUMBER}/$(basename $file)" >> artifacts/s3_links.txt
+                            echo "" >> artifacts/s3_links.txt
+                        done
+                    '''
+                }
+            }
+        }
+
+        stage('Build & Upload Release APK') {
+            steps {
+                withCredentials([
+                    file(credentialsId: 'ANDROID_RELEASE_KEYSTORE', variable: 'RELEASE_KEY_FILE'),
+                    string(credentialsId: 'ANDROID_KEYSTORE_PASS', variable: 'KEYSTORE_PASS'),
+                    string(credentialsId: 'ANDROID_KEY_ALIAS', variable: 'KEY_ALIAS'),
+                    string(credentialsId: 'ANDROID_KEY_PASS', variable: 'KEY_PASS')
+                ]) {
+                    sh '''
+                        ./gradlew assembleRelease \
+                            -Pandroid.injected.signing.store.file="$RELEASE_KEY_FILE" \
+                            -Pandroid.injected.signing.store.password="$KEYSTORE_PASS" \
+                            -Pandroid.injected.signing.key.alias="$KEY_ALIAS" \
+                            -Pandroid.injected.signing.key.password="$KEY_PASS" \
+                            --stacktrace --no-daemon
+                    '''
+
+                    sh '''
+                        for apk in app/build/outputs/apk/release/*.apk; do
+                            [ -f "$apk" ] || continue
+                            name=$(basename "$apk" .apk | sed 's/-release$//' | sed 's/^bizup-//I')
+                            newname="Bizup-${name}-release-${BUILD_NUMBER}.apk"
+                            cp "$apk" "artifacts/$newname"
+                            sha256sum "artifacts/$newname" > "artifacts/$newname.sha256"
+                        done
+                    '''
+                }
+
+                withCredentials([usernamePassword(
+                    credentialsId: 'aws-s3-creds',
+                    usernameVariable: 'AWS_ACCESS_KEY_ID',
+                    passwordVariable: 'AWS_SECRET_ACCESS_KEY'
+                )]) {
+                    sh '''
+                        echo "2. Release APKs Uploaded:" >> artifacts/s3_links.txt
+                        echo "----------------------------------------" >> artifacts/s3_links.txt
+
+                        for file in artifacts/*release*.apk artifacts/*release*.apk.sha256; do
+                            aws s3 cp "$file" "s3://${S3_BUCKET}/builds/${BUILD_NUMBER}/$(basename $file)" --region ${AWS_REGION}
+                        done
+
+                        for file in artifacts/*release*.apk; do
+                            echo "- $(basename $file):" >> artifacts/s3_links.txt
+                            echo "https://${S3_BUCKET}.s3.${AWS_REGION}.amazonaws.com/builds/${BUILD_NUMBER}/$(basename $file)" >> artifacts/s3_links.txt
+                            echo "" >> artifacts/s3_links.txt
+                        done
+                    '''
+                }
+            }
+        }
+
+        stage('Build & Upload AAB') {
+            steps {
+                withCredentials([
+                    file(credentialsId: 'ANDROID_RELEASE_KEYSTORE', variable: 'RELEASE_KEY_FILE'),
+                    string(credentialsId: 'ANDROID_KEYSTORE_PASS', variable: 'KEYSTORE_PASS'),
+                    string(credentialsId: 'ANDROID_KEY_ALIAS', variable: 'KEY_ALIAS'),
+                    string(credentialsId: 'ANDROID_KEY_PASS', variable: 'KEY_PASS')
+                ]) {
+                    sh '''
+                        ./gradlew bundleRelease \
+                            -Pandroid.injected.signing.store.file="$RELEASE_KEY_FILE" \
+                            -Pandroid.injected.signing.store.password="$KEYSTORE_PASS" \
+                            -Pandroid.injected.signing.key.alias="$KEY_ALIAS" \
+                            -Pandroid.injected.signing.key.password="$KEY_PASS" \
+                            --stacktrace --no-daemon
+
+                        mkdir -p artifacts
+                        for bundle in app/build/outputs/bundle/release/*.aab; do
+                            [ -f "$bundle" ] || continue
+                            name=$(basename "$bundle" .aab | sed 's/^bizup-//I')
+                            newname="Bizup-${name}-release-${BUILD_NUMBER}.aab"
+                            cp "$bundle" "artifacts/$newname"
+                            sha256sum "artifacts/$newname" > "artifacts/$newname.sha256"
+                        done
+                    '''
+                }
+
+                withCredentials([usernamePassword(
+                    credentialsId: 'aws-s3-creds',
+                    usernameVariable: 'AWS_ACCESS_KEY_ID',
+                    passwordVariable: 'AWS_SECRET_ACCESS_KEY'
+                )]) {
+                    sh '''
+                        echo "3. Release AABs Uploaded:" >> artifacts/s3_links.txt
+                        echo "----------------------------------------" >> artifacts/s3_links.txt
+
+                        for file in artifacts/*release*.aab artifacts/*release*.aab.sha256; do
+                            aws s3 cp "$file" "s3://${S3_BUCKET}/builds/${BUILD_NUMBER}/$(basename $file)" --region ${AWS_REGION}
+                        done
+
+                        for file in artifacts/*release*.aab; do
+                            echo "- $(basename $file):" >> artifacts/s3_links.txt
+                            echo "https://${S3_BUCKET}.s3.${AWS_REGION}.amazonaws.com/builds/${BUILD_NUMBER}/$(basename $file)" >> artifacts/s3_links.txt
+                            echo "" >> artifacts/s3_links.txt
+                        done
+                    '''
+                }
+            }
+        }
+
+        stage('Archive Artifacts') {
+            steps {
+                archiveArtifacts artifacts: 'artifacts/*', fingerprint: true
+            }
+        }
+    }
+
+    post {
+        always {
+            echo "📦 Build artifacts archived"
+            echo "🔗 Build URL: ${BUILD_URL}"
+            sh 'rm -rf artifacts || true'
+        }
+
+        failure {
+            sh '''
+                echo "=== ❌ Build Failure Diagnostics ==="
+                ./gradlew :app:dependencies --configuration releaseRuntimeClasspath || true
+                ./gradlew signingReport || true
+            '''
+        }
+    }
+}
