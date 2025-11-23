@@ -1,18 +1,28 @@
-# Health Check and Build Automation Scripts
+# 🩺 Health Check and Build Automation Scripts
 
-## Overview
+> Jenkins pipelines for website & API health checks and Android builds.
+
+## 🎯 Overview
 
 This repository contains Jenkins pipelines and supporting assets used to automate:
 
-- **Website health checks** for Bizup and Navo production sites.
-- **Payment API health checks** using Postman and Newman, with rich reporting.
-- **Android app builds** (APK and AAB), signing, and upload to AWS S3.
+ - **🌐 Website health checks** for Bizup and Navo production sites.
+ - **💳 Payment API health checks** using Postman and Newman, with rich reporting.
+ - **📱 Android app builds** (APK and AAB), signing, and upload to AWS S3.
 
 These jobs are intended to run on Jenkins agents that have network access to the target services and the required tooling installed.
 
+## 📋 Table of Contents
+
+- [🎯 Overview](#-overview)
+- [🗂️ Repository structure](#-repository-structure)
+- [🧱 Common infrastructure and tools](#-common-infrastructure-and-tools)
+- [🔍 Module details](#-module-details)
+- [🚀 Getting started](#-getting-started)
+
 ---
 
-## Repository structure
+## 🗂️ Repository structure
 
 ```text
 health_check_scripts/
@@ -36,7 +46,7 @@ health_check_scripts/
   README.md   (this file)
 ```
 
-### Subprojects
+### 📦 Subprojects
 
 - **android_apk_builder**  
   Jenkins pipeline that checks out the Android Git repository, builds debug and release APKs and a release AAB, signs release artifacts, uploads them to S3, and archives links.
@@ -55,7 +65,7 @@ health_check_scripts/
 
 ---
 
-## Common infrastructure and tools
+## 🧱 Common infrastructure and tools
 
 The jobs in this repo assume:
 
@@ -92,7 +102,7 @@ Configure the following credentials in Jenkins (exact IDs must match the Jenkins
 
 ---
 
-## Module details
+## 🔍 Module details
 
 ### 1. Android APK builder (`android_apk_builder`)
 
@@ -215,7 +225,7 @@ From the `payment_health_check` folder:
 
 ---
 
-## Getting started
+## 🚀 Getting started
 
 1. **Clone the repository**
 
